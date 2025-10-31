@@ -14,11 +14,16 @@ import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import javax.imageio.ImageIO
 import fi.iki.elonen.NanoHTTPD
+import org.java_websocket.WebSocket
+import org.java_websocket.handshake.ClientHandshake
+import org.java_websocket.server.WebSocketServer
 import org.slf4j.LoggerFactory
 import java.io.InputStream
 import java.io.PipedInputStream
 import java.io.PipedOutputStream
+import java.net.InetSocketAddress
 import java.nio.file.Paths
+import java.util.concurrent.ArrayBlockingQueue
 
 class RealTimeCast {
     val api = FinanceAPI.getInstance()
@@ -47,6 +52,8 @@ class RealTimeCast {
     // MJPEG streaming server
     private val mjpegServer: MJPEGServer
     private val hls: HLS
+    // WebSocket JPEG streaming server
+    private val webSocketJPEGServer: WebSocketJPEGServer
     // Ticker state for rendering
     @Volatile private var tickerTextParts: List<Pair<String, Color>> = emptyList()
     @Volatile private var tickerText: String = ""
@@ -85,6 +92,7 @@ class RealTimeCast {
         mjpegServer = MJPEGServer(8080) { getLatestFrame() }
         val hlsOutputDir = Paths.get("stream/hls") // 任意のパス
         hls = HLS(hlsOutputDir)
+        webSocketJPEGServer = WebSocketJPEGServer(8081) { getLatestFrame() }
     }
 
     fun start() {
@@ -113,8 +121,9 @@ class RealTimeCast {
             }, 0, 10, TimeUnit.SECONDS)
         }
         startTicker()
-        startHLSStreaming()
+        //startHLSStreaming()
         mjpegServer.start()
+        webSocketJPEGServer.start()
         logger.info("ServerStart")
         // Start frame rendering loop
         tickerExecutor.scheduleAtFixedRate({
@@ -130,6 +139,7 @@ class RealTimeCast {
         timerFuture = null
         companyCycleFuture = null
         mjpegServer.stop()
+        webSocketJPEGServer.stop()
         tickerExecutor.shutdownNow()
     }
 
@@ -421,6 +431,7 @@ class RealTimeCast {
 
         g.dispose()
         lastRenderedFrame = img
+        webSocketJPEGServer.enqueueFrame(lastRenderedFrame!!)
     }
     fun getLatestFrame(): BufferedImage {
         return lastRenderedFrame ?: run {
@@ -580,7 +591,7 @@ class MJPEGServer(
     </style>
   </head>
   <body>
-    <h1>高画質モード（HLS）</h1>
+    <h1>高画質モード（HLS・非推奨）</h1>
     <div class="center-div">
       <a href="/"><button>トップに戻る</button></a>
     </div>
@@ -819,7 +830,8 @@ class MJPEGServer(
     <!-- 遷移ボタン -->
     <div class="center-div">
       <a href="/stream/mjpeg"><button>低遅延モード（MJPEG）</button></a>
-      <a href="/stream/hls"><button>高画質モード（HLS）</button></a>
+      <a href="/stream/ws"><button>低遅延・高品質モード（WebSocket）</button></a>
+      <a href="/stream/hls"><button>高画質モード（HLS・非推奨）</button></a>
     </div>
   </body>
 </html>
@@ -1030,16 +1042,20 @@ class MJPEGServer(
                         val img = getFrame()
                         val baos = ByteArrayOutputStream()
 
-                        // 高画質 JPEG
-                        val writer = ImageIO.getImageWritersByFormatName("jpg").next()
+                        // TwelveMonkeys の JPEGWriter が自動で選ばれる
+                        val writer = ImageIO.getImageWritersByFormatName("jpeg").next()
                         val ios = ImageIO.createImageOutputStream(baos)
                         writer.output = ios
+
                         val param = writer.defaultWriteParam
                         if (param.canWriteCompressed()) {
                             param.compressionMode = javax.imageio.ImageWriteParam.MODE_EXPLICIT
-                            param.compressionQuality = 0.9f
+                            param.compressionQuality = 0.92f
+                            param.progressiveMode = javax.imageio.ImageWriteParam.MODE_DISABLED // 高速化
                         }
+
                         writer.write(null, javax.imageio.IIOImage(img, null, null), param)
+                        ios.flush()
                         writer.dispose()
                         ios.close()
 
@@ -1054,7 +1070,7 @@ class MJPEGServer(
                         pipedOut.write(jpeg)
                         pipedOut.flush()
 
-                        Thread.sleep(33) // 約30FPS
+                        Thread.sleep(15) // 約30FPS
                     }
                 } catch (_: Exception) {
                 } finally {
@@ -1065,7 +1081,359 @@ class MJPEGServer(
             return response
         }
 
+        // --- WebSocket JPEG streaming HTML page ---
+        // /stream/ws: WebSocket JPEG streaming demo page
+        if (session.uri == "/stream/ws") {
+            return newFixedLengthResponse(
+                Response.Status.OK,
+                "text/html",
+                """
+<html>
+  <head>
+    <meta charset="UTF-8">
+    <style>
+      body {
+        background: #181a1b;
+        color: #e5e5e5;
+        min-height: 100vh;
+        margin: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        font-family: 'Segoe UI', 'Meiryo', sans-serif;
+      }
+      h1 {
+        text-align: center;
+        margin-top: 2.5rem;
+        margin-bottom: 1.5rem;
+        font-weight: 600;
+        letter-spacing: 0.03em;
+      }
+      .center-div {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        margin: 2rem 0 0.5rem 0;
+        gap: 1.2em;
+      }
+      button {
+        background: #282c34;
+        color: #e5e5e5;
+        border: none;
+        padding: 0.8em 2.1em;
+        border-radius: 0.5em;
+        font-size: 1.12em;
+        font-weight: 500;
+        cursor: pointer;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.18);
+        transition: background 0.18s, color 0.18s, transform 0.09s;
+        margin: 0 0.3em;
+        font-family: 'Segoe UI', 'Meiryo', sans-serif;
+        letter-spacing: 0.01em;
+        display: flex;
+        align-items: center;
+        gap: 0.5em;
+      }
+      button:hover, button:focus {
+        background: #3d4147;
+        color: #fff;
+        transform: translateY(-2px) scale(1.04);
+      }
+      .icon {
+        font-size: 1.19em;
+        line-height: 1;
+        display: inline-block;
+        vertical-align: middle;
+      }
+      .ws-box {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        margin-top: 1.5em;
+        margin-bottom: 1.2em;
+      }
+      .ws-placeholder {
+        background: #222;
+        border-radius: 0.7em;
+        box-shadow: 0 2px 24px 0 #111a;
+        outline: none;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+        position: relative;
+      }
+      .annotation {
+        color: #b0b0b0;
+        font-size: 0.98em;
+        text-align: center;
+        margin: 0.5em auto 1.5em auto;
+        max-width: 700px;
+      }
+      a {
+        text-align: center;
+        display: inline-block;
+        text-decoration: none;
+      }
+      canvas#jpegCanvas {
+        display: block;
+        max-width: 100%;
+        border-radius: 0.7em;
+        box-shadow: 0 2px 24px 0 #111a;
+        background: #222;
+        width: 960px;
+        height: 540px;
+        object-fit: contain;
+        outline: none;
+        margin: 0 auto;
+      }
+      .video-controls-bar {
+        display: flex;
+        flex-direction: row;
+        justify-content: center;
+        align-items: center;
+        gap: 1.2em;
+        margin-top: 1em;
+      }
+      @media (max-width: 1100px) {
+        canvas#jpegCanvas {
+          width: 98vw;
+          height: auto;
+          max-height: 60vw;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <h1>低遅延・高品質モード（WebSocket）</h1>
+    <div class="center-div">
+      <a href="/"><button>トップに戻る</button></a>
+    </div>
+    <div class="ws-box">
+      <div class="ws-placeholder">
+        <canvas id="jpegCanvas" width="960" height="540"></canvas>
+      </div>
+      <div class="video-controls-bar">
+        <button id="fullscreenBtn" title="全画面表示">
+          <span class="icon">&#x26F6;</span>
+          フルスクリーン
+        </button>
+        <button id="reloadBtn" title="再接続">
+          <span class="icon">&#x21BB;</span>
+          再接続
+        </button>
+      </div>
+    </div>
+    <div class="annotation">
+      WebSocket方式は低遅延・高効率なJPEGストリームです。<br>
+      <b>映像が止まった場合は再接続ボタンをお試しください。</b><br>
+      <br>
+      MaguFinanceRealTimeChart
+    </div>
+    <script>
+      // WebSocket JPEG streaming client
+      let ws;
+      let reconnecting = false;
+      const canvas = document.getElementById('jpegCanvas');
+      const ctx = canvas.getContext('2d');
+      let img = new Image();
+      img.onload = function() {
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      };
+      function connectWS() {
+        if (ws && ws.readyState === 1) ws.close();
+        const proto = window.location.protocol === "https:" ? "wss" : "ws";
+        const url = proto + "://" + window.location.hostname + ":8081";
+        ws = new WebSocket(url);
+        ws.binaryType = "arraybuffer";
+        ws.onopen = function() {
+          reconnecting = false;
+        };
+        ws.onmessage = function(event) {
+          // Assume event.data is ArrayBuffer with JPEG
+          const blob = new Blob([event.data], {type: "image/jpeg"});
+          const url = URL.createObjectURL(blob);
+          img.src = url;
+          // Release object URL after image loads
+          img.onload = function() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            URL.revokeObjectURL(url);
+          };
+        };
+        ws.onerror = function() {
+          if (!reconnecting) reconnect();
+        };
+        ws.onclose = function() {
+          if (!reconnecting) reconnect();
+        };
+      }
+      function reconnect() {
+        reconnecting = true;
+        setTimeout(connectWS, 1000);
+      }
+      connectWS();
+      // Fullscreen button and canvas resizing logic
+      document.addEventListener('DOMContentLoaded', function() {
+        var fullscreenBtn = document.getElementById('fullscreenBtn');
+        var reloadBtn = document.getElementById('reloadBtn');
+
+        function resizeCanvasForFullscreen() {
+          // Check if in fullscreen
+          var fullscreenElement =
+            document.fullscreenElement ||
+            document.webkitFullscreenElement ||
+            document.mozFullScreenElement ||
+            document.msFullscreenElement;
+          if (fullscreenElement === canvas) {
+            // Set canvas size to window size
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+          } else {
+            // Restore to default size
+            canvas.width = 960;
+            canvas.height = 540;
+          }
+        }
+
+        // Listen for fullscreen changes
+        function addFullscreenListeners() {
+          var events = [
+            'fullscreenchange',
+            'webkitfullscreenchange',
+            'mozfullscreenchange',
+            'MSFullscreenChange'
+          ];
+          events.forEach(function(evt) {
+            document.addEventListener(evt, resizeCanvasForFullscreen, false);
+          });
+        }
+        addFullscreenListeners();
+
+        fullscreenBtn.addEventListener('click', function() {
+          if (canvas.requestFullscreen) {
+            canvas.requestFullscreen();
+          } else if (canvas.webkitRequestFullscreen) {
+            canvas.webkitRequestFullscreen();
+          } else if (canvas.mozRequestFullScreen) {
+            canvas.mozRequestFullScreen();
+          } else if (canvas.msRequestFullscreen) {
+            canvas.msRequestFullscreen();
+          }
+        });
+        reloadBtn.addEventListener('click', function() {
+          connectWS();
+        });
+      });
+    </script>
+  </body>
+</html>
+                """.trimIndent()
+            )
+        }
+
         // その他はデフォルト
         return super.serve(session)
+    }
+}
+
+class WebSocketJPEGServer(
+    port: Int,
+    private val getFrame: () -> BufferedImage
+) : WebSocketServer(InetSocketAddress(port)) {
+    @Volatile
+    private var running = false
+
+    private val clients = Collections.synchronizedSet(mutableSetOf<WebSocket>())
+    private var senderThread: Thread? = null
+    private val latestFrameQueue = ArrayBlockingQueue<BufferedImage>(1)
+
+    /**
+     * Called by RealTimeCast after rendering a new frame.
+     * This replaces any previous unconsumed frame in the queue.
+     */
+    fun enqueueFrame(frame: BufferedImage) {
+        // Always keep only the latest frame in the queue
+        latestFrameQueue.poll()
+        latestFrameQueue.offer(frame)
+    }
+
+    override fun onOpen(conn: WebSocket, handshake: ClientHandshake) {
+        clients.add(conn)
+    }
+
+    override fun onClose(conn: WebSocket, code: Int, reason: String, remote: Boolean) {
+        clients.remove(conn)
+    }
+
+    override fun onMessage(conn: WebSocket, message: String) {
+        // No-op: stateless
+    }
+
+    override fun onError(conn: WebSocket?, ex: Exception) {
+        // Optionally log
+    }
+
+    override fun onStart() {
+        running = true
+        // Start sender thread if not already running
+        if (senderThread == null || !senderThread!!.isAlive) {
+            senderThread = Thread {
+                while (running) {
+                    try {
+                        // Wait for next frame (blocks until available)
+                        val img = latestFrameQueue.take()
+                        val baos = ByteArrayOutputStream()
+                        // Use TwelveMonkeys JPEG writer if present
+                        val writer = ImageIO.getImageWritersByFormatName("jpeg").next()
+                        val ios = ImageIO.createImageOutputStream(baos)
+                        writer.output = ios
+                        val param = writer.defaultWriteParam
+                        if (param.canWriteCompressed()) {
+                            param.compressionMode = javax.imageio.ImageWriteParam.MODE_EXPLICIT
+                            param.compressionQuality = 0.92f
+                            param.progressiveMode = javax.imageio.ImageWriteParam.MODE_DISABLED
+                        }
+                        writer.write(null, javax.imageio.IIOImage(img, null, null), param)
+                        ios.flush()
+                        writer.dispose()
+                        ios.close()
+                        val jpeg = baos.toByteArray()
+                        // Send to all clients
+                        val currentClients = clients.toList()
+                        for (ws in currentClients) {
+                            try {
+                                if (ws.isOpen) {
+                                    ws.send(jpeg)
+                                }
+                            } catch (_: Exception) {
+                                // Ignore
+                            }
+                        }
+                        Thread.sleep(8) // ~60FPS
+                    } catch (_: InterruptedException) {
+                        break
+                    } catch (_: Exception) {
+                        Thread.sleep(16)
+                    }
+                }
+            }
+            senderThread!!.isDaemon = true
+            senderThread!!.start()
+        }
+    }
+
+    override fun stop() {
+        running = false
+        try {
+            super.stop()
+        } catch (_: Exception) {}
+        try {
+            senderThread?.interrupt()
+        } catch (_: Exception) {}
+        clients.clear()
+        latestFrameQueue.clear()
     }
 }
